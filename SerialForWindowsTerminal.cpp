@@ -204,31 +204,40 @@ static boost::system::error_code InitializeSerialPort(boost::asio::serial_port& 
     return ec;
 }
 
+// 当串口掉线（拔出）时置为 true，用于通知主循环重新弹出串口选择窗口
+static bool g_serialPortLost = false;
+
 template <class TStream1, class TStream2>
-static void DoStreamToStream(TStream1& stream1, TStream2& stream2, std::vector<uint8_t>& buffer)
+static void DoStreamToStream(TStream1& stream1, TStream2& stream2, std::vector<uint8_t>& buffer, boost::asio::io_service& ioctx)
 {
     stream1.async_read_some(
         boost::asio::buffer(buffer.data(), buffer.size()),
-        [&stream1, &stream2, &buffer](const boost::system::error_code& ec, std::size_t bytes_transferred)
+        [&stream1, &stream2, &buffer, &ioctx](const boost::system::error_code& ec, std::size_t bytes_transferred)
         {
             if (ec)
             {
                 std::cerr << "\033[31m" << "error : " << ec.message() << "\033[0m" << std::endl;
+                // 串口读写出错（例如设备被拔出），标记串口已断开并停止 io_context 事件循环
+                g_serialPortLost = true;
+                ioctx.stop();
             }
             else
             {
                 boost::asio::async_write(
                     stream2,
                     boost::asio::const_buffer(buffer.data(), bytes_transferred),
-                    [&stream1, &stream2, &buffer](const boost::system::error_code& ec, std::size_t bytes_transferred)
+                    [&stream1, &stream2, &buffer, &ioctx](const boost::system::error_code& ec, std::size_t bytes_transferred)
                     {
                         if (ec)
                         {
                             std::cerr << "\033[31m" << "error : " << ec.message() << "\033[0m" << std::endl;
+                            // 写入串口失败（例如设备被拔出），标记串口已断开并停止 io_context 事件循环
+                            g_serialPortLost = true;
+                            ioctx.stop();
                         }
                         else
                         {
-                            DoStreamToStream(stream1, stream2, buffer);
+                            DoStreamToStream(stream1, stream2, buffer, ioctx);
                         }
                     }
                 );
@@ -257,10 +266,49 @@ static boost::system::error_code DoWork(boost::asio::io_service& ioctx, boost::a
     if (stdoutput.assign(conout, ec))
         return ec;
 
-    DoStreamToStream(serialPort, stdoutput, serialPortRecvBuffer);
-    DoStreamToStream(stdinput, serialPort, serialPortSendBuffer);
+    g_serialPortLost = false;
+    DoStreamToStream(serialPort, stdoutput, serialPortRecvBuffer, ioctx);
+    DoStreamToStream(stdinput, serialPort, serialPortSendBuffer, ioctx);
     ioctx.run(ec);
     return ec;
+}
+
+static int ShowPortSelectDialogAndOpen(boost::asio::io_service& ioctx, boost::asio::serial_port& serialPort)
+{
+    boost::system::error_code ec;
+    while (true)
+    {
+        auto hWndParent = ::GetForegroundWindow();
+        if (hWndParent == nullptr)
+            hWndParent = GetConsoleWindow();
+        if (DialogBoxParam(hInstance, MAKEINTRESOURCE(IDD_SETTING_DIALOG), hWndParent, SettingFunc, 1) == IDOK)
+        {
+            auto cfg = ReadSerialConfig();
+            auto portName = std::string("COM") + std::to_string(cfg.Serial);
+            if (serialPort.is_open())
+            {
+                boost::system::error_code ecClose;
+                serialPort.close(ecClose);
+            }
+            if (serialPort.open(portName, ec))
+            {
+                std::cerr << "\033[31m" << "can not open " << portName << "\033[0m" << std::endl;
+                std::cerr << "\033[31m" << "error : " << ec.message() << "\033[0m" << std::endl;
+                continue;
+            }
+            if (InitializeSerialPort(serialPort, cfg, ec))
+            {
+                std::cerr << "\033[31m" << "can not initialize " << portName << "\033[0m" << std::endl;
+                std::cerr << "\033[31m" << "error : " << ec.message() << "\033[0m" << std::endl;
+                continue;
+            }
+            return ERROR_SUCCESS;
+        }
+        else
+        {
+            return ERROR_CANCELLED;
+        }
+    }
 }
 
 int wmain(int argc, const WCHAR* args[])
@@ -288,39 +336,28 @@ int wmain(int argc, const WCHAR* args[])
 
     while (true)
     {
-        auto hWndParent = ::GetForegroundWindow();
-        if (hWndParent == nullptr)
-            hWndParent = GetConsoleWindow();
-        if (DialogBoxParam(hInstance, MAKEINTRESOURCE(IDD_SETTING_DIALOG), hWndParent, SettingFunc, 1) == IDOK)
-        {
-            auto cfg = ReadSerialConfig();
-            auto portName = std::string("COM") + std::to_string(cfg.Serial);
-            if (serialPort.open(portName, ec))
-            {
-                std::cerr << "\033[31m" << "can not open " << portName << "\033[0m" <<std::endl;
-                std::cerr << "\033[31m" << "error : " << ec.message() << "\033[0m" << std::endl;
-                continue;
-            }
-            if (InitializeSerialPort(serialPort, cfg, ec))
-            {
-                std::cerr << "\033[31m" << "can not initialize " << portName << "\033[0m" << std::endl;
-                std::cerr << "\033[31m" << "error : " << ec.message() << "\033[0m" << std::endl;
-                continue;
-            }
-            break;
-        }
-        else
+        auto ret = ShowPortSelectDialogAndOpen(ioctx, serialPort);
+        if (ret == ERROR_CANCELLED)
         {
             return ERROR_CANCELLED;
         }
+
+        ec = DoWork(ioctx, serialPort);
+
+        if (g_serialPortLost)
+        {
+            // 串口掉线（设备被拔出或读写错误），提示用户并重新弹出串口选择窗口
+            std::cerr << "\033[31m" << "serial port disconnected, please select port again" << "\033[0m" << std::endl;
+            ioctx.reset();
+            continue;
+        }
+        if (ec)
+        {
+            std::cerr << "\033[31m" << "error : " << ec.message() << "\033[0m" << std::endl;
+            return ec.value();
+        }
+        return ERROR_SUCCESS;
     }
-    ec = DoWork(ioctx, serialPort);
-    if (ec)
-    {
-        std::cerr << "\033[31m" << "error : " << ec.message() << "\033[0m" << std::endl;
-        return ec.value();
-    }
-    return ERROR_SUCCESS;
 }
 
 // “关于”框的消息处理程序。
